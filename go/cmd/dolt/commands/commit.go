@@ -468,9 +468,127 @@ func getAddedNotStaged(notStagedTbls []diff.TableDelta, notStagedDocs *diff.DocD
 	return lines
 }
 
+func getRemoteCommitTracking(ctx context.Context, dEnv *env.DoltEnv) error {
+	rsr := dEnv.RepoStateReader()
+	headRef := rsr.CWBHeadRef()
+	remoteRefSpecs, err := env.GetRefSpecs(rsr, "")
+	if err != nil {
+		return err
+	}
+
+	if len(remoteRefSpecs) == 0 {
+		return nil
+	}
+
+	remotes, err := rsr.GetRemotes()
+	if err != nil {
+		return err
+	}
+
+	remote := remotes[remoteRefSpecs[0].GetRemote()]
+	srcDB, err := remote.GetRemoteDBWithoutCaching(ctx, dEnv.DoltDB.ValueReadWriter().Format())
+	if err != nil {
+		return fmt.Errorf("failed to get remote db; %w", err)
+	}
+
+	branchRefs, err := srcDB.GetBranchesWithHashes(ctx)
+	if err != nil {
+		return err
+	}
+
+	var remoteRef doltdb.BranchWithHash
+	for _, ref := range branchRefs {
+		if ref.Ref.GetPath() == headRef.GetPath() {
+			remoteRef = ref
+		}
+	}
+
+	headCS, err := doltdb.NewCommitSpec("HEAD")
+	if err != nil {
+		return err
+	}
+	headCM, err := dEnv.DoltDB.Resolve(ctx, headCS, rsr.CWBHeadRef())
+	if err != nil {
+		return err
+	}
+	remoteBranSpec, err := doltdb.NewCommitSpec(remoteRef.Hash.String())
+	if err != nil {
+		return err
+	}
+
+	// TODO : fetch is needed to update remote branch ref hash. This will fail, if there is commit added in remote branch
+	// and has not fetched, it should use last known remote hash.
+	remoteBranCommit, err := dEnv.DoltDB.Resolve(ctx, remoteBranSpec, dEnv.RepoStateReader().CWBHeadRef())
+	if err != nil {
+		return err
+	}
+
+	ancCommit, err := doltdb.GetCommitAncestor(ctx, headCM, remoteBranCommit)
+
+	ancHeight, err := ancCommit.Height()
+	if err != nil {
+		return err
+	}
+	ah, _ := ancCommit.HashOf()
+	ahs := ah.String()
+	if ahs == "" {
+	}
+	headHeight, err := headCM.Height()
+	if err != nil {
+		return err
+	}
+	hh, _ := headCM.HashOf()
+	hhs := hh.String()
+	if hhs == "" {
+	}
+	remoteHeight, err := remoteBranCommit.Height()
+	if err != nil {
+		return err
+	}
+	rh, _ := remoteBranCommit.HashOf()
+	rhs := rh.String()
+	if rhs == "" {
+	}
+	rbn := fmt.Sprintf("remotes/%s/%s", remote.Name, remoteRef.Ref.GetPath())
+	ahead := headHeight - ancHeight
+	behind := remoteHeight - ancHeight
+
+	cli.Println(getRemoteTrackingMsg(rbn, ahead, behind))
+	return nil
+}
+
+func getRemoteTrackingMsg(remoteBranchName string, ahead uint64, behind uint64) string {
+	if ahead > 0 && behind > 0 {
+		return fmt.Sprintf(`Your branch and '%s' have diverged,
+and have %v and %v different commits each, respectively."
+  (use "dolt pull" to update your local branch)`, remoteBranchName, ahead, behind)
+	} else if ahead > 0 {
+		s := ""
+		if ahead > 1 {
+			s = "s"
+		}
+		return fmt.Sprintf(`Your branch is ahead of '%s' by %v commit%s.
+  (use "dolt push" to publish your local commits)`, remoteBranchName, ahead, s)
+	} else if behind > 0 {
+		s := ""
+		if behind > 1 {
+			s = "s"
+		}
+		return fmt.Sprintf(`Your branch is behind '%s' by %v commit%s, and can be fast-forwarded.
+  (use "dolt pull" to update your local branch)`, remoteBranchName, behind, s)
+	} else {
+		return fmt.Sprintf("Your branch is up to date with '%s'.", remoteBranchName)
+	}
+}
+
 // TODO: working docs in conflict param not used here
 func PrintStatus(ctx context.Context, dEnv *env.DoltEnv, stagedTbls, notStagedTbls []diff.TableDelta, workingTblsInConflict, workingTblsWithViolations []string, stagedDocs, notStagedDocs *diff.DocDiffs) error {
 	cli.Printf(branchHeader, dEnv.RepoStateReader().CWBHeadRef().GetPath())
+
+	err := getRemoteCommitTracking(ctx, dEnv)
+	if err != nil {
+		return err
+	}
 
 	mergeActive, err := dEnv.IsMergeActive(ctx)
 	if err != nil {
